@@ -1,0 +1,30 @@
+{
+  "name": "Flowise Governance-First Agent",
+  "image": "mcr.microsoft.com/devcontainers/javascript-node:20",
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "20"
+    }
+  },
+  "forwardPorts": [3000, 3001],
+  "portsAttributes": {
+    "3000": {
+      "label": "Flowise UI",
+      "onAutoForward": "openBrowser"
+    },
+    "3001": {
+      "label": "Governance HITL Approval Server",
+      "onAutoForward": "notify"
+    }
+  },
+  "postCreateCommand": "npm install -g pnpm && pnpm install",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        "ms-vscode.vscode-typescript-next"
+      ]
+    }
+  }
+}

@@ -1,0 +1,98 @@
+{
+  "version": "1.0",
+  "rules": [
+    {
+      "name": "block_destructive_sql",
+      "match": {
+        "tool": "execute_sql",
+        "args": {
+          "query": { "contains_any": ["DROP", "DELETE", "TRUNCATE", "ALTER"] }
+        }
+      },
+      "action": "deny",
+      "reason": "Destructive SQL is forbidden. Use a migration pipeline."
+    },
+    {
+      "name": "block_admin_api",
+      "match": {
+        "tool": "call_api",
+        "args": {
+          "endpoint": { "contains_any": ["/admin", "/superuser", "/internal"] }
+        }
+      },
+      "action": "deny",
+      "reason": "Privileged API endpoints are blocked."
+    },
+    {
+      "name": "escalate_large_transfer",
+      "match": {
+        "tool": "transfer_funds",
+        "args": {
+          "amount": { "greater_than": 1000 }
+        }
+      },
+      "action": "escalate",
+      "reason": "Transfers above $1,000 require human approval (policy FIN-007)."
+    },
+    {
+      "name": "escalate_customer_email",
+      "match": {
+        "tool": "send_email",
+        "args": {
+          "recipient_type": { "equals": "customer" }
+        }
+      },
+      "action": "escalate",
+      "reason": "Customer-facing emails need human review before sending."
+    },
+    {
+      "name": "allow_read_sql",
+      "match": {
+        "tool": "execute_sql",
+        "args": {
+          "query": { "starts_with": "SELECT" }
+        }
+      },
+      "action": "allow",
+      "reason": "Read-only SELECT queries are always permitted."
+    },
+    {
+      "name": "allow_small_transfer",
+      "match": {
+        "tool": "transfer_funds",
+        "args": {
+          "amount": { "less_than_or_equal": 1000 }
+        }
+      },
+      "action": "allow",
+      "reason": "Transfers <= $1,000 are pre-approved."
+    },
+    {
+      "name": "allow_internal_email",
+      "match": {
+        "tool": "send_email",
+        "args": {
+          "recipient_type": { "equals": "internal" }
+        }
+      },
+      "action": "allow",
+      "reason": "Internal emails are auto-approved."
+    },
+    {
+      "name": "allow_kb_search",
+      "match": {
+        "tool": "search_knowledge_base"
+      },
+      "action": "allow",
+      "reason": "Read-only knowledge base search is always permitted."
+    },
+    {
+      "name": "default_deny",
+      "match": {
+        "tool": "*"
+      },
+      "action": "deny",
+      "reason": "No matching policy found. Default-deny applied."
+    }
+  ]
+}

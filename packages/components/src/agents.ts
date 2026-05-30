@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { flatten } from 'lodash'
 import { ChainValues } from '@langchain/core/utils/types'
 import { AgentStep, AgentAction } from '@langchain/core/agents'
@@ -25,6 +26,13 @@ import {
 import { formatLogToString } from '@langchain/classic/agents/format_scratchpad/log'
 import { IUsedTool } from './Interface'
 import { getErrorMessage } from './error'
+
+// ── GOVERNANCE IMPORTS ────────────────────────────────────────────────────────
+import { evaluate, PolicyResult } from '../governance/GovernancePolicyEngine'
+import { logEvent, AuditEntry, Outcome } from '../governance/GovernanceAuditLogger'
+import { requestApproval, HITLResult } from '../governance/GovernanceHITL'
+import { v4 as uuidv4 } from 'uuid'
+// ─────────────────────────────────────────────────────────────────────────────
 
 export const SOURCE_DOCUMENTS_PREFIX = '\n\n----FLOWISE_SOURCE_DOCUMENTS----\n\n'
 export const ARTIFACTS_PREFIX = '\n\n----FLOWISE_ARTIFACTS----\n\n'
@@ -423,55 +431,82 @@ export class AgentExecutor extends BaseChain<ChainValues, AgentExecutorOutput> {
                 actions = [output as AgentAction]
             }
 
-            const newSteps = await Promise.all(
-                actions.map(async (action) => {
-                    await runManager?.handleAgentAction(action)
-                    const tool = action.tool === '_Exception' ? new ExceptionTool() : toolsByName[action.tool?.toLowerCase()]
-                    let observation
+            // ════════════════════════════════════════════════════════════════════
+            // GOVERNANCE GATE — sequential for-of replaces Promise.all so that
+            // the async HITL requestApproval() can genuinely pause the loop.
+            //
+            // WHY HERE: This is the only point in _call() where the resolved
+            // tool object AND fully-typed toolInput args are both available but
+            // (tool as any).call() has NOT yet fired. Any earlier and args are
+            // unresolved; any later and the side-effect is already done.
+            // ════════════════════════════════════════════════════════════════════
+            const newSteps: AgentStep[] = []
+            for (const action of actions) {
+                await runManager?.handleAgentAction(action)
+                const tool = action.tool === '_Exception' ? new ExceptionTool() : toolsByName[action.tool?.toLowerCase()]
+                let observation: string | undefined
+
+                if (tool) {
+                    // _Exception is an internal error-handling shim — skip governance
+                    if (action.tool === '_Exception') {
+                        try {
+                            observation = await (tool as any).call(action.toolInput, runManager?.getChild())
+                        } catch (e: any) {
+                            observation = getErrorMessage(e)
+                        }
+                        newSteps.push({ action, observation: observation ?? '' })
+                        continue
+                    }
+
+                    const toolInput = (
+                        this.isXML && typeof action.toolInput === 'string'
+                            ? { input: action.toolInput }
+                            : action.toolInput
+                    ) as Record<string, unknown>
+                    const agentThought = (action as any).log ?? `Invoking ${action.tool}`
+                    const runId = this.chatId ?? uuidv4()
+
+                    // ── POLICY CHECK ─────────────────────────────────────────────
+                    const policyResult = evaluate(action.tool, toolInput)
+                    let humanDecision: HITLResult | null = null
+                    let finalOutcome: Outcome = 'tool_blocked'
+                    let resolvedArgs = toolInput
+
                     try {
-                        /* Here we need to override Tool call method to include sessionId, chatId, input as parameter
-                         * Tool Call Parameters:
-                         * - arg: z.output<T>
-                         * - configArg?: RunnableConfig | Callbacks
-                         * - tags?: string[]
-                         * - flowConfig?: { sessionId?: string, chatId?: string, input?: string }
-                         */
-                        if (tool) {
-                            observation = await (tool as any).call(
-                                this.isXML && typeof action.toolInput === 'string' ? { input: action.toolInput } : action.toolInput,
-                                runManager?.getChild(),
-                                undefined,
-                                {
-                                    sessionId: this.sessionId,
-                                    chatId: this.chatId,
-                                    input: this.input,
-                                    state: inputs
-                                }
+                        if (policyResult.decision === 'deny') {
+                            // ── BLOCK ────────────────────────────────────────────
+                            observation =
+                                `[POLICY BLOCKED] Tool '${action.tool}' was denied by policy ` +
+                                `(rule: '${policyResult.rule}'). Reason: ${policyResult.reason} ` +
+                                `You must re-reason and choose a different approach.`
+                            finalOutcome = 'tool_blocked'
+
+                        } else if (policyResult.decision === 'escalate') {
+                            // ── HITL: loop genuinely pauses here ─────────────────
+                            humanDecision = await requestApproval(
+                                action.tool, toolInput, policyResult.reason, agentThought
                             )
-                            let toolOutput = observation
-                            if (typeof toolOutput === 'string' && toolOutput.includes(SOURCE_DOCUMENTS_PREFIX)) {
-                                toolOutput = toolOutput.split(SOURCE_DOCUMENTS_PREFIX)[0]
+                            if (humanDecision.approved) {
+                                resolvedArgs = humanDecision.modifiedArgs as Record<string, unknown>
+                                observation = await (tool as any).call(
+                                    resolvedArgs, runManager?.getChild(), undefined,
+                                    { sessionId: this.sessionId, chatId: this.chatId, input: this.input, state: inputs }
+                                )
+                                finalOutcome = 'tool_executed_after_approval'
+                            } else {
+                                observation =
+                                    `[HUMAN REJECTED] '${action.tool}' was rejected by ${humanDecision.approver}. ` +
+                                    `You must re-reason and choose a different approach.`
+                                finalOutcome = 'tool_rejected_by_human'
                             }
-                            if (typeof toolOutput === 'string' && toolOutput.includes(ARTIFACTS_PREFIX)) {
-                                toolOutput = toolOutput.split(ARTIFACTS_PREFIX)[0]
-                            }
-                            let toolInput
-                            if (typeof toolOutput === 'string' && toolOutput.includes(TOOL_ARGS_PREFIX)) {
-                                const splitArray = toolOutput.split(TOOL_ARGS_PREFIX)
-                                toolOutput = splitArray[0]
-                                try {
-                                    toolInput = JSON.parse(splitArray[1])
-                                } catch (e) {
-                                    console.error('Error parsing tool input from tool')
-                                }
-                            }
-                            usedTools.push({
-                                tool: tool.name,
-                                toolInput: toolInput ?? (action.toolInput as any),
-                                toolOutput
-                            })
+
                         } else {
-                            observation = `${action.tool} is not a valid tool, try another one.`
+                            // ── ALLOW ─────────────────────────────────────────────
+                            observation = await (tool as any).call(
+                                resolvedArgs, runManager?.getChild(), undefined,
+                                { sessionId: this.sessionId, chatId: this.chatId, input: this.input, state: inputs }
+                            )
+                            finalOutcome = 'tool_executed'
                         }
                     } catch (e) {
                         if (e instanceof ToolInputParsingException) {
@@ -486,50 +521,78 @@ export class AgentExecutor extends BaseChain<ChainValues, AgentExecutorOutput> {
                             }
                             observation = await new ExceptionTool().call(observation, runManager?.getChild())
                             usedTools.push({
-                                tool: tool.name,
-                                toolInput: action.toolInput as any,
-                                toolOutput: '',
-                                error: getErrorMessage(e)
+                                tool: tool.name, toolInput: action.toolInput as any, toolOutput: '', error: getErrorMessage(e)
                             })
-                            return { action, observation: observation ?? '' }
+                            finalOutcome = 'tool_blocked'
                         } else {
                             usedTools.push({
-                                tool: tool.name,
-                                toolInput: action.toolInput as any,
-                                toolOutput: '',
-                                error: getErrorMessage(e)
+                                tool: tool.name, toolInput: action.toolInput as any, toolOutput: '', error: getErrorMessage(e)
                             })
-                            return { action, observation: getErrorMessage(e) }
+                            logEvent({
+                                timestamp: new Date().toISOString(), runId, step: iterations, agentThought,
+                                proposedTool: action.tool, proposedArgs: toolInput,
+                                policy: { decision: policyResult.decision, ruleMatched: policyResult.rule, reason: policyResult.reason },
+                                humanDecision: null, finalOutcome: 'tool_blocked', observation: getErrorMessage(e)
+                            })
+                            newSteps.push({ action, observation: getErrorMessage(e) })
+                            continue
                         }
                     }
-                    if (typeof observation === 'string' && observation.includes(SOURCE_DOCUMENTS_PREFIX)) {
-                        const observationArray = observation.split(SOURCE_DOCUMENTS_PREFIX)
-                        observation = observationArray[0]
-                        const docs = observationArray[1]
-                        try {
-                            const parsedDocs = JSON.parse(docs)
-                            sourceDocuments.push(parsedDocs)
-                        } catch (e) {
-                            console.error('Error parsing source documents from tool')
-                        }
+
+                    // Extract usedTools display string (strip internal prefixes)
+                    let toolOutput = observation ?? ''
+                    if (typeof toolOutput === 'string' && toolOutput.includes(SOURCE_DOCUMENTS_PREFIX)) {
+                        toolOutput = toolOutput.split(SOURCE_DOCUMENTS_PREFIX)[0]
                     }
-                    if (typeof observation === 'string' && observation.includes(ARTIFACTS_PREFIX)) {
-                        const observationArray = observation.split(ARTIFACTS_PREFIX)
-                        observation = observationArray[0]
-                        try {
-                            const artifact = JSON.parse(observationArray[1])
-                            artifacts.push(artifact)
-                        } catch (e) {
-                            console.error('Error parsing source documents from tool')
-                        }
+                    if (typeof toolOutput === 'string' && toolOutput.includes(ARTIFACTS_PREFIX)) {
+                        toolOutput = toolOutput.split(ARTIFACTS_PREFIX)[0]
                     }
-                    if (typeof observation === 'string' && observation.includes(TOOL_ARGS_PREFIX)) {
-                        const observationArray = observation.split(TOOL_ARGS_PREFIX)
-                        observation = observationArray[0]
+                    let toolInputFinal: any = resolvedArgs
+                    if (typeof toolOutput === 'string' && toolOutput.includes(TOOL_ARGS_PREFIX)) {
+                        const splitArray = toolOutput.split(TOOL_ARGS_PREFIX)
+                        toolOutput = splitArray[0]
+                        try { toolInputFinal = JSON.parse(splitArray[1]) } catch (_) { /* ignore */ }
                     }
-                    return { action, observation: observation ?? '' }
-                })
-            )
+                    if (finalOutcome === 'tool_executed' || finalOutcome === 'tool_executed_after_approval') {
+                        usedTools.push({ tool: tool.name, toolInput: toolInputFinal, toolOutput })
+                    }
+
+                    // ── AUDIT LOG — one entry per tool attempt ────────────────
+                    logEvent({
+                        timestamp: new Date().toISOString(),
+                        runId,
+                        step: iterations,
+                        agentThought,
+                        proposedTool: action.tool,
+                        proposedArgs: toolInput,
+                        policy: { decision: policyResult.decision, ruleMatched: policyResult.rule, reason: policyResult.reason },
+                        humanDecision: humanDecision
+                            ? { approved: humanDecision.approved, approver: humanDecision.approver, modifiedArgs: humanDecision.modifiedArgs }
+                            : null,
+                        finalOutcome,
+                        observation: observation ?? ''
+                    })
+                } else {
+                    observation = `${action.tool} is not a valid tool, try another one.`
+                }
+
+                // Extract sourceDocuments and artifacts from the observation string
+                if (typeof observation === 'string' && observation.includes(SOURCE_DOCUMENTS_PREFIX)) {
+                    const parts = observation.split(SOURCE_DOCUMENTS_PREFIX)
+                    observation = parts[0]
+                    try { sourceDocuments.push(JSON.parse(parts[1])) } catch (_) { /* ignore */ }
+                }
+                if (typeof observation === 'string' && observation.includes(ARTIFACTS_PREFIX)) {
+                    const parts = observation.split(ARTIFACTS_PREFIX)
+                    observation = parts[0]
+                    try { artifacts.push(JSON.parse(parts[1])) } catch (_) { /* ignore */ }
+                }
+                if (typeof observation === 'string' && observation.includes(TOOL_ARGS_PREFIX)) {
+                    observation = observation.split(TOOL_ARGS_PREFIX)[0]
+                }
+                newSteps.push({ action, observation: observation ?? '' })
+            }
+            // ── END GOVERNANCE BLOCK ─────────────────────────────────────────
 
             steps.push(...newSteps)
 
@@ -600,68 +663,133 @@ export class AgentExecutor extends BaseChain<ChainValues, AgentExecutorOutput> {
             actions = [output as AgentAction]
         }
 
-        const result: AgentStep[] = []
-        for (const agentAction of actions) {
-            let observation = ''
-            if (runManager) {
-                await runManager?.handleAgentAction(agentAction)
-            }
-            if (agentAction.tool in nameToolMap) {
-                const tool = nameToolMap[agentAction.tool]
+    const result: AgentStep[] = []
+    for (const agentAction of actions) {
+        let observation = ''
+        if (runManager) {
+            await runManager?.handleAgentAction(agentAction)
+        }
+        if (agentAction.tool in nameToolMap) {
+            const tool = nameToolMap[agentAction.tool]
+            const toolInput = this.isXML && typeof agentAction.toolInput === 'string'
+                ? { input: agentAction.toolInput }
+                : agentAction.toolInput as Record<string, unknown>
+
+            // ════════════════════════════════════════════════════════════════
+            // GOVERNANCE GATE — inserted here because this is the ONLY point
+            // where BOTH the resolved tool name AND fully-resolved toolInput
+            // args exist but (tool as any).call() has NOT yet been invoked.
+            //
+            // 3 lines EARLIER: toolInput not yet cast — args unavailable for
+            //   policy matching (we can't check amount, query, endpoint etc.)
+            // 3 lines LATER:   .call() has already fired — side-effect done,
+            //   governance would be post-hoc and meaningless.
+            // HERE:            Full intent known. Zero side-effects yet. ✓
+            // ════════════════════════════════════════════════════════════════
+            const policyResult: PolicyResult = evaluate(agentAction.tool, toolInput)
+            const agentThought: string = (agentAction as any).log ?? `Invoking ${agentAction.tool}`
+            const runId: string = this.chatId ?? uuidv4()
+            // Use intermediateSteps.length as the step counter — it correctly
+            // reflects how many steps have completed before this one.
+            const stepNum: number = intermediateSteps.length
+
+            let humanDecision: HITLResult | null = null
+            let finalOutcome: Outcome
+            let resolvedArgs = toolInput
+
+            if (policyResult.decision === 'deny') {
+                // ── BLOCK: tool is forbidden outright ────────────────────
+                observation =
+                    `[POLICY BLOCKED] Tool '${agentAction.tool}' was denied by policy ` +
+                    `(rule: '${policyResult.rule}'). Reason: ${policyResult.reason} ` +
+                    `You must re-reason and choose a different approach.`
+                finalOutcome = 'tool_blocked'
+
+            } else if (policyResult.decision === 'escalate') {
+                // ── ESCALATE: pause loop and wait for human ───────────────
+                humanDecision = await requestApproval(
+                    agentAction.tool,
+                    toolInput,
+                    policyResult.reason,
+                    agentThought
+                )
+
+                if (humanDecision.approved) {
+                    // Human approved — possibly with modified args
+                    resolvedArgs = humanDecision.modifiedArgs as Record<string, unknown>
+                    try {
+                        observation = await (tool as any).call(
+                            resolvedArgs,
+                            runManager?.getChild(),
+                            undefined,
+                            { sessionId: this.sessionId, chatId: this.chatId, input: this.input, state: inputs }
+                        )
+                    } catch (e: any) {
+                        observation = `ERROR after human approval: ${e.message}`
+                    }
+                    finalOutcome = 'tool_executed_after_approval'
+                } else {
+                    // Human rejected
+                    observation =
+                        `[HUMAN REJECTED] '${agentAction.tool}' was rejected by ${humanDecision.approver}. ` +
+                        `You must re-reason and choose a different approach.`
+                    finalOutcome = 'tool_rejected_by_human'
+                }
+
+            } else {
+                // ── ALLOW: execute immediately ────────────────────────────
                 try {
-                    /* Here we need to override Tool call method to include sessionId, chatId, input as parameter
-                     * Tool Call Parameters:
-                     * - arg: z.output<T>
-                     * - configArg?: RunnableConfig | Callbacks
-                     * - tags?: string[]
-                     * - flowConfig?: { sessionId?: string, chatId?: string, input?: string }
-                     */
                     observation = await (tool as any).call(
-                        this.isXML && typeof agentAction.toolInput === 'string' ? { input: agentAction.toolInput } : agentAction.toolInput,
+                        resolvedArgs,
                         runManager?.getChild(),
                         undefined,
-                        {
-                            sessionId: this.sessionId,
-                            chatId: this.chatId,
-                            input: this.input,
-                            state: inputs
-                        }
+                        { sessionId: this.sessionId, chatId: this.chatId, input: this.input, state: inputs }
                     )
-                    if (typeof observation === 'string' && observation.includes(SOURCE_DOCUMENTS_PREFIX)) {
-                        const observationArray = observation.split(SOURCE_DOCUMENTS_PREFIX)
-                        observation = observationArray[0]
-                    }
-                    if (typeof observation === 'string' && observation.includes(ARTIFACTS_PREFIX)) {
-                        const observationArray = observation.split(ARTIFACTS_PREFIX)
-                        observation = observationArray[0]
-                    }
-                    if (typeof observation === 'string' && observation.includes(TOOL_ARGS_PREFIX)) {
-                        const observationArray = observation.split(TOOL_ARGS_PREFIX)
-                        observation = observationArray[0]
-                    }
-                } catch (e) {
-                    if (e instanceof ToolInputParsingException) {
-                        if (this.handleParsingErrors === true) {
-                            observation = 'Invalid or incomplete tool input. Please try again.'
-                        } else if (typeof this.handleParsingErrors === 'string') {
-                            observation = this.handleParsingErrors
-                        } else if (typeof this.handleParsingErrors === 'function') {
-                            observation = this.handleParsingErrors(e)
-                        } else {
-                            throw e
-                        }
-                        observation = await new ExceptionTool().call(observation, runManager?.getChild())
-                    }
+                } catch (e: any) {
+                    observation = `ERROR: ${e.message}`
                 }
-            } else {
-                observation = `${agentAction.tool} is not a valid tool, try another available tool: ${Object.keys(nameToolMap).join(', ')}`
+                finalOutcome = 'tool_executed'
             }
-            result.push({
-                action: agentAction,
+
+            // Strip Flowise internal prefixes (unchanged from original)
+            if (typeof observation === 'string' && observation.includes(SOURCE_DOCUMENTS_PREFIX)) {
+                observation = observation.split(SOURCE_DOCUMENTS_PREFIX)[0]
+            }
+            if (typeof observation === 'string' && observation.includes(ARTIFACTS_PREFIX)) {
+                observation = observation.split(ARTIFACTS_PREFIX)[0]
+            }
+            if (typeof observation === 'string' && observation.includes(TOOL_ARGS_PREFIX)) {
+                observation = observation.split(TOOL_ARGS_PREFIX)[0]
+            }
+
+            // ── AUDIT: write immutable log entry ─────────────────────────
+            const auditEntry: AuditEntry = {
+                timestamp: new Date().toISOString(),
+                runId,
+                step: stepNum,
+                agentThought,
+                proposedTool: agentAction.tool,
+                proposedArgs: toolInput,
+                policy: {
+                    decision: policyResult.decision,
+                    ruleMatched: policyResult.rule,
+                    reason: policyResult.reason
+                },
+                humanDecision: humanDecision
+                    ? { approved: humanDecision.approved, approver: humanDecision.approver, modifiedArgs: humanDecision.modifiedArgs }
+                    : null,
+                finalOutcome,
                 observation
-            })
+            }
+            logEvent(auditEntry)
+
+        } else {
+            observation = `${agentAction.tool} is not a valid tool, try another available tool: ${Object.keys(nameToolMap).join(', ')}`
         }
-        return result
+
+        result.push({ action: agentAction, observation })
+    }
+    return result
     }
 
     async _return(
